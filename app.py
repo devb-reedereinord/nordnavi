@@ -27,12 +27,12 @@ with st.sidebar:
     
     # New Chat button - starts a new conversation
     if st.button("➕ New Chat"):
-    st.session_state.chat_sessions.append({
-        "title": "New Chat",
-        "messages": []
-    })
-    st.session_state.current_chat = len(st.session_state.chat_sessions) - 1
-    st.session_state.trigger_rerun = True
+        st.session_state.chat_sessions.append({
+            "title": "New Chat",
+            "messages": []
+        })
+        st.session_state.current_chat = len(st.session_state.chat_sessions) - 1
+        st.session_state.trigger_rerun = True
     
     # Clear Chat History button - wipes all stored conversations
     if st.button("🗑️ Clear Chat History"):
