@@ -29,22 +29,25 @@ def load_and_chunk(filepath, chunk_size=800):
 
         if para.startswith('# '):
             current_chapter = para[2:].strip()
-            continue
-        if para.startswith('## '):
+        elif para.startswith('## '):
             current_section = para[3:].strip()
-            continue
-        if para.startswith('### '):
+        elif para.startswith('### '):
             current_subsection = para[4:].strip()
-            continue
-        if para.startswith('##### '):
-            current_topic = para[6:].strip()
-            continue
-        if para.startswith('###### '):
-            current_topic = para[7:].strip()
-            continue
-
-        if len(para) > 0:
+        elif para.startswith('##### ') or para.startswith('###### '):
+            current_topic = para[6:].strip() if para.startswith('##### ') else para[7:].strip()
+        else:
+            # Flush if title switch and temp_para is not empty
+            if temp_para:
+                chunks.append(temp_para.strip())
+                metadata.append({
+                    "chapter": current_chapter,
+                    "section": current_section,
+                    "subsection": current_subsection,
+                    "topic": current_topic
+                })
+                temp_para = ""
             temp_para += para + " "
+
             if len(temp_para) >= chunk_size:
                 chunks.append(temp_para.strip())
                 metadata.append({
@@ -66,15 +69,15 @@ def load_and_chunk(filepath, chunk_size=800):
 
     return chunks, metadata
 
-# Load embedding model
+# Embedding model
 model = SentenceTransformer('all-MiniLM-L6-v2')
 
-# Normalize embeddings for cosine similarity
+# Normalize embeddings
 def normalize_embeddings(embeddings):
     norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
     return embeddings / norms
 
-# Create or load FAISS index
+# FAISS index
 def get_faiss_index(chunks, index_path="index_cosine.faiss", meta_path="chunks_cosine.pkl"):
     if os.path.exists(index_path) and os.path.exists(meta_path):
         print("Loading existing FAISS index and metadata...")
@@ -95,57 +98,58 @@ def get_faiss_index(chunks, index_path="index_cosine.faiss", meta_path="chunks_c
         pickle.dump(chunks, f)
     return chunks, index
 
-# Improved keyword extractor with synonyms
+# Keyword extractor with synonyms
 def extract_keywords(query):
     base_words = [word.lower() for word in re.findall(r'\w+', query) if len(word) > 3]
-    
+
     synonyms = {
         "ukc": ["ukc", "under keel clearance", "clearance"],
         "depth": ["depth", "deep", "water depth"],
         "anchorage": ["anchorage", "anchor", "anchoring"],
         "watchkeeping": ["watchkeeping", "bridge watch", "watch"],
-        "draft": ["draft", "draught"]
+        "draft": ["draft", "draught"],
+        "panama": ["panama", "canal", "panama canal", "locks", "gatun", "neopanamax"],
+        "transit": ["transit", "passage", "canal transit"],
+        "pilotage": ["pilotage", "pilot", "harbor pilot", "compulsory pilotage"]
     }
-    
-    expanded = set()
+
+    expanded = set(base_words)
     for word in base_words:
-        expanded.add(word)
-        for key, syns in synonyms.items():
-            if word in syns:
-                expanded.update(syns)
+        for syn_list in synonyms.values():
+            if word in syn_list:
+                expanded.update(syn_list)
 
     return list(expanded)
 
-# Soft keyword matching
+# Simple keyword match
 def keyword_match(chunk, keywords):
     chunk_lower = chunk.lower()
-    for keyword in keywords:
-        if keyword in chunk_lower:
-            return True
-    return False
+    return any(keyword in chunk_lower for keyword in keywords)
 
-# Find relevant chunks with fallback
+# Search logic
 def find_relevant_chunks(query, chunks, index, top_k=8):
+    important_words = extract_keywords(query)
+
+    # Use keyword match only for short or known-topic queries
+    if len(query.split()) <= 5:
+        matches = [chunk for chunk in chunks if keyword_match(chunk, important_words)]
+        return matches[:top_k] if matches else []
+
+    # Semantic + keyword filtered
     query_embedding = model.encode([query], convert_to_numpy=True)
     query_embedding = normalize_embeddings(query_embedding)
-
     distances, indices = index.search(query_embedding, top_k)
-    initial_results = [chunks[i] for i in indices[0]]
+    faiss_results = [chunks[i] for i in indices[0]]
+    filtered = [chunk for chunk in faiss_results if keyword_match(chunk, important_words)]
 
-    important_words = extract_keywords(query)
-    filtered_results = [chunk for chunk in initial_results if keyword_match(chunk, important_words)]
+    if filtered:
+        return filtered
 
-    if filtered_results:
-        return filtered_results
+    # Fallback to loose keyword matching over all
+    fallback_matches = [chunk for chunk in chunks if keyword_match(chunk, important_words)]
+    return fallback_matches[:top_k] if fallback_matches else faiss_results
 
-    # Fallback: simple full-text contains
-    brute_matches = [chunk for chunk in chunks if any(word in chunk.lower() for word in important_words)]
-    if brute_matches:
-        return brute_matches[:top_k]
-
-    return initial_results  # final fallback
-
-# Ask GPT using context
+# Ask GPT
 def ask_gpt(question, context):
     prompt = f"""
 You are a helpful assistant. Based only on the information provided below, answer the user's question.
@@ -165,7 +169,7 @@ Answer:
     )
     return response.choices[0].message.content
 
-# Initialize chatbot
+# Init chatbot
 def initialize_chatbot(file_path):
     print("Loading and chunking file...")
     chunks, metadata = load_and_chunk(file_path)
