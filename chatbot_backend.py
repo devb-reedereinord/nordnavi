@@ -132,14 +132,18 @@ def find_relevant_chunks(query, chunks, index, top_k=8):
     distances, indices = index.search(query_embedding, top_k)
     initial_results = [chunks[i] for i in indices[0]]
 
-    # Keyword filter
     important_words = extract_keywords(query)
     filtered_results = [chunk for chunk in initial_results if keyword_match(chunk, important_words)]
 
     if filtered_results:
         return filtered_results
-    else:
-        return initial_results  # fallback if no keyword match
+
+    # Fallback: simple full-text contains
+    brute_matches = [chunk for chunk in chunks if any(word in chunk.lower() for word in important_words)]
+    if brute_matches:
+        return brute_matches[:top_k]
+
+    return initial_results  # final fallback
 
 # Ask GPT using context
 def ask_gpt(question, context):
