@@ -10,7 +10,7 @@ from openai import OpenAI
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 # Load and chunk the text file
-def load_and_chunk(filepath, chunk_size=800):
+def load_and_chunk(filepath, chunk_size=2000):
     with open(filepath, 'r', encoding='utf-8') as f:
         text = f.read()
 
@@ -152,12 +152,12 @@ def find_relevant_chunks(query, chunks, index, top_k=8):
 # Ask GPT
 def ask_gpt(question, context):
     prompt = f"""
-You are a helpful assistant. Based only on the information provided below, answer the user's question.
+You are a helpful assistant trained to answer questions based strictly on the provided context.
 
-- Use your best judgement to infer an answer if relevant information is found.
-- If the information is absolutely not present, then reply exactly: 'The answer is not available in the database.'
+- Use the most relevant points from the context to construct your answer.
+- If the answer cannot be determined, say: "The answer may not be fully covered in the current database context, but here's what I can infer."
 
-Context from database:
+Context:
 {context}
 
 Question: {question}
