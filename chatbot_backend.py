@@ -1,179 +1,278 @@
 import os
 import re
-import numpy as np
-import faiss
+import uuid
 import pickle
+import numpy as np
+from dataclasses import dataclass
+from typing import List, Dict, Any, Tuple
+from pathlib import Path
+
+import faiss
 from sentence_transformers import SentenceTransformer
 from openai import OpenAI
 
-# Initialize OpenAI client with API key from environment variable
+# -------- Config --------
+MODEL_NAME = os.getenv("NORDNAVI_MODEL", "gpt-4o-mini")
+EMBED_MODEL = os.getenv("NORDNAVI_EMBED_MODEL", "all-MiniLM-L6-v2")
+
+# -------- Clients / Models --------
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+embedder = SentenceTransformer(EMBED_MODEL)
 
-# Load and chunk the text file
-def load_and_chunk(filepath, chunk_size=2000):
-    with open(filepath, 'r', encoding='utf-8') as f:
-        text = f.read()
+# -------- Data structures --------
+@dataclass
+class Chunk:
+    id: str
+    text: str
+    chapter: str
+    section: str
+    subsection: str
+    topic: str
 
-    paragraphs = text.split('\n\n')
+@dataclass
+class KB:
+    chunks: List[Chunk]
+    faiss_index: Any
+    embeddings: np.ndarray
+    tfidf_vocab: Dict[str, int]
+    tfidf_matrix: np.ndarray  # dense for simplicity
+    id_to_idx: Dict[str, int]
+
+# --------- Text utilities ---------
+def _normalize(text: str) -> str:
+    return re.sub(r"\s+", " ", text.strip())
+
+def _heading_level(line: str) -> int:
+    m = re.match(r'^(#{1,6})\s+', line)
+    return len(m.group(1)) if m else 0
+
+# --------- Loader / chunker ---------
+def load_and_chunk(filepath: str, chunk_size: int = 1400, overlap: int = 120) -> List[Chunk]:
+    lines = Path(filepath).read_text(encoding="utf-8").splitlines()
+    chapter = section = subsection = topic = "Unknown"
+    buffer = []
     chunks = []
-    metadata = []
 
-    current_chapter = "Unknown Chapter"
-    current_section = "Unknown Section"
-    current_subsection = "Unknown Subsection"
-    current_topic = "Unknown Topic"
-    temp_para = ""
+    def flush_buffer():
+        nonlocal buffer, chunks, chapter, section, subsection, topic
+        if not buffer:
+            return
+        text = _normalize(" ".join(buffer))
+        # sliding windows inside the buffer for long sections
+        start = 0
+        while start < len(text):
+            part = text[start:start+chunk_size]
+            if not part:
+                break
+            chunks.append(Chunk(
+                id=str(uuid.uuid4()),
+                text=part,
+                chapter=chapter, section=section, subsection=subsection, topic=topic
+            ))
+            if start + chunk_size >= len(text):
+                break
+            start = max(start + chunk_size - overlap, start + 1)
+        buffer = []
 
-    for para in paragraphs:
-        para = para.strip()
-
-        if para.startswith('# '):
-            current_chapter = para[2:].strip()
-        elif para.startswith('## '):
-            current_section = para[3:].strip()
-        elif para.startswith('### '):
-            current_subsection = para[4:].strip()
-        elif para.startswith('##### ') or para.startswith('###### '):
-            current_topic = para[6:].strip() if para.startswith('##### ') else para[7:].strip()
+    for raw in lines:
+        lvl = _heading_level(raw)
+        if lvl == 1:
+            flush_buffer()
+            chapter = raw.lstrip("# ").strip()
+        elif lvl == 2:
+            flush_buffer()
+            section = raw.lstrip("# ").strip()
+        elif lvl == 3:
+            flush_buffer()
+            subsection = raw.lstrip("# ").strip()
+        elif lvl >= 5:
+            flush_buffer()
+            topic = raw.lstrip("# ").strip()
         else:
-            # Flush if title switch and temp_para is not empty
-            if temp_para:
-                chunks.append(temp_para.strip())
-                metadata.append({
-                    "chapter": current_chapter,
-                    "section": current_section,
-                    "subsection": current_subsection,
-                    "topic": current_topic
-                })
-                temp_para = ""
-            temp_para += para + " "
+            if raw.strip() == "":
+                buffer.append("\n")
+            else:
+                buffer.append(raw.strip() + " ")
+    flush_buffer()
+    return chunks
 
-            if len(temp_para) >= chunk_size:
-                chunks.append(temp_para.strip())
-                metadata.append({
-                    "chapter": current_chapter,
-                    "section": current_section,
-                    "subsection": current_subsection,
-                    "topic": current_topic
-                })
-                temp_para = ""
+# --------- FAISS + TF-IDF ---------
+def _normalize_embeddings(emb):
+    norms = np.linalg.norm(emb, axis=1, keepdims=True) + 1e-12
+    return emb / norms
 
-    if temp_para:
-        chunks.append(temp_para.strip())
-        metadata.append({
-            "chapter": current_chapter,
-            "section": current_section,
-            "subsection": current_subsection,
-            "topic": current_topic
-        })
-
-    return chunks, metadata
-
-# Embedding model
-model = SentenceTransformer('all-MiniLM-L6-v2')
-
-# Normalize embeddings
-def normalize_embeddings(embeddings):
-    norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
-    return embeddings / norms
-
-# FAISS index
-def get_faiss_index(chunks, index_path="index_cosine.faiss", meta_path="chunks_cosine.pkl"):
-    if os.path.exists(index_path) and os.path.exists(meta_path):
-        print("Loading existing FAISS index and metadata...")
-        index = faiss.read_index(index_path)
-        with open(meta_path, 'rb') as f:
-            stored_chunks = pickle.load(f)
-        return stored_chunks, index
-
-    print("Creating FAISS index from scratch...")
-    embeddings = model.encode(chunks, convert_to_numpy=True)
-    embeddings = normalize_embeddings(embeddings)
-
+def _build_faiss(embeddings: np.ndarray):
     dim = embeddings.shape[1]
     index = faiss.IndexFlatIP(dim)
     index.add(embeddings)
-    faiss.write_index(index, index_path)
-    with open(meta_path, 'wb') as f:
-        pickle.dump(chunks, f)
-    return chunks, index
+    return index
 
-# Keyword extractor with synonyms
-def extract_keywords(query):
-    base_words = [word.lower() for word in re.findall(r'\w+', query) if len(word) > 3]
+def _build_tfidf_matrix(chunks: List[Chunk]) -> Tuple[Dict[str,int], np.ndarray]:
+    # simple TF-IDF (no external deps) — bag of words, lowercase, alnum tokens
+    from collections import Counter
+    docs_tokens = []
+    vocab_set = set()
+    for c in chunks:
+        tokens = re.findall(r"[a-zA-Z0-9]{3,}", c.text.lower())
+        docs_tokens.append(tokens)
+        vocab_set.update(tokens)
+    vocab = {t:i for i,t in enumerate(sorted(vocab_set))}
+    N = len(chunks)
+    V = len(vocab)
+    df = np.zeros(V, dtype=np.float32)
+    tf_counts = []
+    for tokens in docs_tokens:
+        cnt = Counter(tokens)
+        tf_counts.append(cnt)
+        for t in cnt:
+            df[vocab[t]] += 1.0
+    idf = np.log((N + 1) / (df + 1)) + 1  # smoothed
+    # build dense TF-IDF (for small corpora this is fine)
+    tfidf = np.zeros((N, V), dtype=np.float32)
+    for i, cnt in enumerate(tf_counts):
+        total = sum(cnt.values()) or 1
+        for t, c in cnt.items():
+            j = vocab[t]
+            tfidf[i, j] = (c / total) * idf[j]
+    # L2 normalize rows
+    norms = np.linalg.norm(tfidf, axis=1, keepdims=True) + 1e-12
+    tfidf = tfidf / norms
+    return vocab, tfidf
 
+# --------- Public API ---------
+def initialize_chatbot(file_path: str) -> KB:
+    chunks = load_and_chunk(file_path)
+    texts = [c.text for c in chunks]
+    emb = embedder.encode(texts, convert_to_numpy=True, batch_size=64, show_progress_bar=False)
+    emb = _normalize_embeddings(emb)
+    faiss_index = _build_faiss(emb)
+    vocab, tfidf = _build_tfidf_matrix(chunks)
+    id_to_idx = {c.id: i for i, c in enumerate(chunks)}
+    return KB(chunks=chunks, faiss_index=faiss_index, embeddings=emb, tfidf_vocab=vocab, tfidf_matrix=tfidf, id_to_idx=id_to_idx)
+
+def build_conversation_context(history_messages: List[Dict[str,str]]) -> str:
+    out = []
+    for m in history_messages:
+        role = "User" if m["role"] == "user" else "Assistant"
+        out.append(f"{role}: {m['content']}")
+    return "\n".join(out)
+
+def _keyword_boost(query: str) -> List[str]:
+    base = [w.lower() for w in re.findall(r"[a-zA-Z0-9]{3,}", query)]
     synonyms = {
-        "ukc": ["ukc", "under keel clearance", "clearance"],
-        "depth": ["depth", "deep", "water depth"],
-        "anchorage": ["anchorage", "anchor", "anchoring"],
-        "watchkeeping": ["watchkeeping", "bridge watch", "watch"],
+        "ukc": ["ukc", "under", "keel", "clearance"],
         "draft": ["draft", "draught"],
-        "panama": ["panama", "canal", "panama canal", "locks", "gatun", "neopanamax"],
-        "transit": ["transit", "passage", "canal transit"],
-        "pilotage": ["pilotage", "pilot", "harbor pilot", "compulsory pilotage"]
+        "anchorage": ["anchorage", "anchor", "anchoring"],
+        "pilotage": ["pilotage", "pilot", "harbor", "harbour"],
+        "panama": ["panama", "canal", "neopanamax", "locks", "gatun"],
     }
-
-    expanded = set(base_words)
-    for word in base_words:
-        for syn_list in synonyms.values():
-            if word in syn_list:
-                expanded.update(syn_list)
-
+    expanded = set(base)
+    for w in base:
+        for syns in synonyms.values():
+            if w in syns:
+                expanded.update(syns)
     return list(expanded)
 
-# Simple keyword match
-def keyword_match(chunk, keywords):
-    chunk_lower = chunk.lower()
-    return any(keyword in chunk_lower for keyword in keywords)
+def retrieve_with_hybrid_search(kb: KB, query: str, conversation: str = "", top_k: int = 8) -> List[Dict[str, Any]]:
+    # Compose query with recent conversation for better semantic match
+    composed = (conversation + "\n" + query).strip() if conversation else query
 
-# Search logic
-def find_relevant_chunks(query, chunks, index, top_k=8):
-    important_words = extract_keywords(query)
+    # Semantic
+    q_emb = embedder.encode([composed], convert_to_numpy=True)
+    q_emb = _normalize_embeddings(q_emb)
+    D, I = kb.faiss_index.search(q_emb, top_k * 3)  # over-fetch
+    sem_ids = [int(i) for i in I[0]]
 
-    # Use keyword match only for short or known-topic queries
-    if len(query.split()) <= 5:
-        matches = [chunk for chunk in chunks if keyword_match(chunk, important_words)]
-        return matches[:top_k] if matches else []
+    # Lexical TF-IDF
+    tokens = re.findall(r"[a-zA-Z0-9]{3,}", composed.lower())
+    vec = np.zeros(len(kb.tfidf_vocab), dtype=np.float32)
+    for t in tokens:
+        j = kb.tfidf_vocab.get(t)
+        if j is not None:
+            vec[j] += 1.0
+    if np.linalg.norm(vec) > 1e-9:
+        vec = vec / (np.linalg.norm(vec) + 1e-12)
+    # cosine similarity with dense tfidf
+    lex_scores = kb.tfidf_matrix @ vec  # shape (N,)
 
-    # Semantic + keyword filtered
-    query_embedding = model.encode([query], convert_to_numpy=True)
-    query_embedding = normalize_embeddings(query_embedding)
-    distances, indices = index.search(query_embedding, top_k)
-    faiss_results = [chunks[i] for i in indices[0]]
-    filtered = [chunk for chunk in faiss_results if keyword_match(chunk, important_words)]
+    # Combine (min-max scale both, then weighted)
+    sem_scores = np.zeros(len(kb.chunks), dtype=np.float32)
+    sem_scores[sem_ids] = D[0]
+    # min-max
+    def scale(x):
+        mn, mx = float(x.min()), float(x.max())
+        return (x - mn) / (mx - mn + 1e-9) if mx > mn else x*0
+    s_sem = scale(sem_scores)
+    s_lex = scale(lex_scores)
+    w_sem, w_lex = 0.65, 0.35
+    combo = w_sem * s_sem + w_lex * s_lex
 
-    if filtered:
-        return filtered
+    # Keyword filter (light)
+    boosts = set(_keyword_boost(query))
+    mask = np.zeros(len(kb.chunks), dtype=bool)
+    for i, c in enumerate(kb.chunks):
+        if any(b in c.text.lower() for b in boosts):
+            mask[i] = True
+    # rank
+    idxs = np.argsort(-combo)
+    ranked = [i for i in idxs if combo[i] > 0]
+    if mask.any():
+        ranked = [i for i in ranked if mask[i]] + [i for i in ranked if not mask[i]]
+    top = ranked[:top_k]
 
-    # Fallback to loose keyword matching over all
-    fallback_matches = [chunk for chunk in chunks if keyword_match(chunk, important_words)]
-    return fallback_matches[:top_k] if fallback_matches else faiss_results
+    results = []
+    for i in top:
+        c = kb.chunks[i]
+        results.append({
+            "id": c.id,
+            "chunk": c.text,
+            "meta": {
+                "chapter": c.chapter,
+                "section": c.section,
+                "subsection": c.subsection,
+                "topic": c.topic
+            }
+        })
+    return results
 
-# Ask GPT
-def ask_gpt(question, context):
-    prompt = f"""
-You are a helpful assistant trained to answer questions based strictly on the provided context.
+def _build_prompt(retrieved: List[Dict[str, Any]], query: str, strict: bool) -> str:
+    ctx = "\n\n---\n\n".join([r["chunk"] for r in retrieved])
+    policy = (
+        "Answer ONLY using the context. If the context is insufficient, say "
+        "\"The answer may not be fully covered in the current database context, but here's what I can infer.\""
+        if strict else
+        "Prefer the context. If needed, you may add general background knowledge, but do NOT contradict the context."
+    )
+    return f"""You are a ship-management domain assistant answering strictly from company documentation.
 
-- Use the most relevant points from the context to construct your answer.
-- If the answer cannot be determined, say: "The answer may not be fully covered in the current database context, but here's what I can infer."
+{policy}
 
-Context:
-{context}
+Cite nothing except the provided context text; do not invent document names or numbers.
+Use concise, structured bullets when appropriate.
 
-Question: {question}
+[Context begins]
+{ctx}
+[Context ends]
+
+User question: {query}
+
 Answer:
 """
-    response = client.chat.completions.create(
-        model="gpt-3.5-turbo",
-        messages=[{"role": "user", "content": prompt}]
-    )
-    return response.choices[0].message.content
 
-# Init chatbot
-def initialize_chatbot(file_path):
-    print("Loading and chunking file...")
-    chunks, metadata = load_and_chunk(file_path)
-    print(f"Chunked into {len(chunks)} parts. Loading FAISS index...")
-    chunks, index = get_faiss_index(chunks)
-    print("Chatbot ready.")
-    return chunks, metadata, index
+def ask_gpt_with_context(query: str, retrieved: List[Dict[str, Any]], strict: bool = True) -> str:
+    prompt = _build_prompt(retrieved, query, strict)
+    resp = client.chat.completions.create(
+        model=MODEL_NAME,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.2,
+    )
+    return resp.choices[0].message.content
+
+def get_source_metadata(kb: KB, chunk_id: str) -> Dict[str,str]:
+    i = kb.id_to_idx.get(chunk_id, None)
+    if i is None:
+        return {"chapter":"Unknown","section":"Unknown","subsection":"Unknown","topic":"Unknown"}
+    c = kb.chunks[i]
+    return {"chapter": c.chapter, "section": c.section, "subsection": c.subsection, "topic": c.topic}
+
+
