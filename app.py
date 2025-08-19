@@ -1,5 +1,5 @@
 import streamlit as st
-from chatbot_backend_refactored import (
+from chatbot_backend import (
     initialize_chatbot,
     build_conversation_context,
     retrieve_with_hybrid_search,
@@ -147,3 +147,4 @@ if user_input:
                     meta = get_source_metadata(kb, s["id"])
                     st.markdown(f"**Source {i}** — {meta['chapter']} ▸ {meta['section']} ▸ {meta['subsection']} ▸ {meta['topic']}")
                     st.code(s["preview"])
+
