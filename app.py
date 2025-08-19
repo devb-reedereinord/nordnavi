@@ -1,169 +1,149 @@
 import streamlit as st
-from chatbot_backend import initialize_chatbot, find_relevant_chunks, ask_gpt
+from chatbot_backend_refactored import (
+    initialize_chatbot,
+    build_conversation_context,
+    retrieve_with_hybrid_search,
+    ask_gpt_with_context,
+    get_source_metadata
+)
+import json
+from pathlib import Path
 
-# Load the chatbot system on first run
-@st.cache_resource
-def load_chatbot():
+st.set_page_config(page_title="📚 NordNavi+", page_icon="🤖", layout="wide")
+
+# ---------- Persistent storage helpers ----------
+DATA_DIR = Path(".nordnavi")
+DATA_DIR.mkdir(exist_ok=True)
+SESSIONS_PATH = DATA_DIR / "sessions.json"
+
+def load_sessions():
+    if SESSIONS_PATH.exists():
+        try:
+            return json.loads(SESSIONS_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            return []
+    return []
+
+def save_sessions(chat_sessions):
+    try:
+        SESSIONS_PATH.write_text(json.dumps(chat_sessions, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as e:
+        st.warning(f"Couldn't save chat history: {e}")
+
+# ---------- Load knowledge base (cached) ----------
+@st.cache_resource(show_spinner=False)
+def load_kb():
     file_path = "databasebot.txt"
-    chunks, metadata, index = initialize_chatbot(file_path)
-    return chunks, metadata, index
+    return initialize_chatbot(file_path)
 
-st.set_page_config(page_title="📚 Private Chatbot", page_icon="🤖")
-st.title("📚 NordNavi")
+kb = load_kb()
 
-# Load resources
-with st.spinner("Loading database and building chatbot..."):
-    chunks, metadata, index = load_chatbot()
-
-# Session state initialization
+# ---------- Session state ----------
 if "chat_sessions" not in st.session_state:
-    st.session_state.chat_sessions = []  # List of chats
-if "current_chat" not in st.session_state:
-    st.session_state.current_chat = None  # Active chat index
+    st.session_state.chat_sessions = load_sessions()
 
-# Sidebar for chat navigation and history controls
+if "current_chat" not in st.session_state:
+    st.session_state.current_chat = 0 if st.session_state.chat_sessions else None
+
+# Create first chat on cold start
+if st.session_state.current_chat is None:
+    st.session_state.chat_sessions.append({"title": "New Chat", "messages": []})
+    st.session_state.current_chat = 0
+
+# ---------- Sidebar ----------
 with st.sidebar:
-    st.header("💬 Chat History")
-    
-    # New Chat button - starts a new conversation
-    if st.button("➕ New Chat"):
-        st.session_state.chat_sessions.append({
-            "title": "New Chat",
-            "messages": []
-        })
-        st.session_state.current_chat = len(st.session_state.chat_sessions) - 1
-        st.session_state.trigger_rerun = True
-    
-    # Clear Chat History button - wipes all stored conversations
-    if st.button("🗑️ Clear Chat History"):
-        st.session_state.chat_sessions = []
-        st.session_state.current_chat = None
-        st.experimental_rerun()
-    
-    # List previous chats for selection
+    st.header("💬 Chats")
+    cols = st.columns([1,1])
+    with cols[0]:
+        if st.button("➕ New Chat", use_container_width=True):
+            st.session_state.chat_sessions.append({"title": "New Chat", "messages": []})
+            st.session_state.current_chat = len(st.session_state.chat_sessions) - 1
+            save_sessions(st.session_state.chat_sessions)
+            st.experimental_rerun()
+    with cols[1]:
+        if st.button("🗑️ Clear All", use_container_width=True):
+            st.session_state.chat_sessions = []
+            st.session_state.current_chat = None
+            try:
+                SESSIONS_PATH.unlink(missing_ok=True)
+            except Exception:
+                pass
+            st.experimental_rerun()
+
+    # Chat list
     for idx, chat in enumerate(st.session_state.chat_sessions):
-        button_label = chat["title"] if chat["title"] != "" else "Untitled Chat"
-        if st.button(button_label, key=f"chat_{idx}"):
+        is_active = (idx == st.session_state.current_chat)
+        label = chat["title"] or "Untitled"
+        if st.button(("▶ " if is_active else "• ") + label, key=f"chat_{idx}", use_container_width=True):
             st.session_state.current_chat = idx
             st.experimental_rerun()
 
-# If no chat exists yet, create one
-if st.session_state.current_chat is None and not st.session_state.chat_sessions:
-    st.session_state.chat_sessions.append({
-        "title": "New Chat",
-        "messages": []
-    })
-    st.session_state.current_chat = 0
+    # Preferences
+    st.markdown("---")
+    st.caption("Preferences")
+    st.session_state.setdefault("strict_mode", True)
+    st.session_state.setdefault("max_history_turns", 12)
+    st.session_state["strict_mode"] = st.toggle("Strictly answer from context", value=st.session_state["strict_mode"])
+    st.session_state["max_history_turns"] = st.slider("History turns used for context", 4, 30, st.session_state["max_history_turns"])
 
-# Get active chat
-active_chat = st.session_state.chat_sessions[st.session_state.current_chat]
+st.title("📚 NordNavi+")
+st.caption("Private RAG chatbot")
 
-# Replay previous messages with per-message source display
-for message in active_chat["messages"]:
-    with st.chat_message(message["role"]):
-        if message["role"] == "user":
-            st.markdown(f"**You:** {message['content']}")
-        else:
-            st.markdown(f"**Bot:** {message['content']}")
-            if "sources" in message and message["sources"]:
-                # Show primary source fully
-                best_chunk = message["sources"][0]
-                try:
-                    meta_idx = chunks.index(best_chunk)
-                    meta = metadata[meta_idx]
-                    with st.expander("📄 Primary Source for this answer"):
-                        st.markdown(f"""
-📚 **Chapter:** {meta['chapter']}  
-📑 **Section:** {meta['section']}  
-🧩 **Subsection:** {meta['subsection']}  
-🧷 **Topic:** {meta['topic']}  
+active = st.session_state.chat_sessions[st.session_state.current_chat]
 
-> {best_chunk}
-                        """)
-                except ValueError:
-                    st.markdown("> Primary source metadata not found.")
-                # List other sources in brief if available
-                if len(message["sources"]) > 1:
-                    with st.expander("📄 Other Related Sources (Brief)"):
-                        for idx2, chunk in enumerate(message["sources"][1:], start=2):
-                            try:
-                                meta_idx = chunks.index(chunk)
-                                meta = metadata[meta_idx]
-                                st.markdown(f"- **Source {idx2}:** {meta['chapter']} ➔ {meta['section']} ➔ {meta['subsection']} ➔ {meta['topic']}")
-                            except ValueError:
-                                st.markdown(f"- Source {idx2}: Metadata not found.")
+# ---------- Replay messages ----------
+for msg in active["messages"]:
+    with st.chat_message(msg["role"]):
+        st.markdown(msg["content"])
+        if msg.get("sources"):
+            with st.expander("📄 Sources for this answer"):
+                for i, s in enumerate(msg["sources"], start=1):
+                    meta = get_source_metadata(kb, s["id"])
+                    st.markdown(f"**Source {i}** — {meta['chapter']} ▸ {meta['section']} ▸ {meta['subsection']} ▸ {meta['topic']}")
+                    st.code(s["preview"])
 
-# Chat input area
-user_input = st.chat_input("Ask a question based on the database:")
+# ---------- Chat input ----------
+user_input = st.chat_input("Ask about your database...")
 
 if user_input:
-    # Save user message in current chat session
-    active_chat["messages"].append({"role": "user", "content": user_input})
-    
-    # Update chat title based on the first message if it is still "New Chat"
-    if active_chat["title"] == "New Chat":
-        active_chat["title"] = user_input[:40] + "..." if len(user_input) > 40 else user_input
-    # Optionally, you can generate a dynamic title using GPT once a few messages are exchanged.
-    elif len(active_chat["messages"]) == 3:
-        try:
-            auto_title = ask_gpt("Summarize this conversation into a short title:", user_input)
-            active_chat["title"] = auto_title.strip()
-        except Exception:
-            pass
+    # Append user message
+    active["messages"].append({"role": "user", "content": user_input})
+    # Title update
+    if active["title"] == "New Chat":
+        active["title"] = user_input[:40] + ("..." if len(user_input) > 40 else "")
 
-    with st.chat_message("user"):
-        st.markdown(f"**You:** {user_input}")
+    with st.spinner("🔎 Retrieving relevant context..."):
+        # Build conversation-aware query
+        history_slice = active["messages"][-(st.session_state["max_history_turns"]*2):]
+        conversation_text = build_conversation_context(history_slice)
+        # Hybrid retrieve
+        retrieved = retrieve_with_hybrid_search(kb, query=user_input, conversation=conversation_text, top_k=8)
 
-    with st.spinner("Thinking..."):
-        # Build full conversation context for better responses (last 6 exchanges)
-        max_turns = 6  # 6 exchanges (user + assistant pairs)
-        relevant_messages = active_chat["messages"][-max_turns*2:]
-        conversation_context = ""
-        for msg in relevant_messages:
-            role = "User" if msg["role"] == "user" else "Assistant"
-            conversation_context += f"{role}: {msg['content']}\n"
+    with st.spinner("🤖 Thinking..."):
+        # Ask model with safety rails
+        answer = ask_gpt_with_context(
+            query=user_input,
+            retrieved=retrieved,
+            strict=st.session_state["strict_mode"]
+        )
 
-        # Retrieve relevant chunks based on full context and latest user input
-        relevant_chunks = find_relevant_chunks(conversation_context + user_input, chunks, index)
-        context = "\n---\n".join(relevant_chunks)
+    # Prepare pretty sources
+    pretty_sources = [{
+        "id": r["id"],
+        "preview": r["chunk"][:800]
+    } for r in retrieved]
 
-        # Generate GPT answer using the context
-        response = ask_gpt(user_input, context)
+    active["messages"].append({"role": "assistant", "content": answer, "sources": pretty_sources})
 
-    # Save assistant response along with associated sources (only if answer is found)
-    active_chat["messages"].append({
-        "role": "assistant",
-        "content": response,
-        "sources": relevant_chunks if "not available" not in response.lower() else []
-    })
+    # Persist
+    save_sessions(st.session_state.chat_sessions)
 
-    # Display assistant response and the corresponding sources
+    # Stream to UI
     with st.chat_message("assistant"):
-        st.markdown(f"**Bot:** {response}")
-        if "not available" not in response.lower() and relevant_chunks:
-            best_chunk = relevant_chunks[0]
-            try:
-                meta_idx = chunks.index(best_chunk)
-                meta = metadata[meta_idx]
-                with st.expander("📄 Primary Source for this answer"):
-                    st.markdown(f"""
-📚 **Chapter:** {meta['chapter']}  
-📑 **Section:** {meta['section']}  
-🧩 **Subsection:** {meta['subsection']}  
-🧷 **Topic:** {meta['topic']}  
-
-> {best_chunk}
-                    """)
-            except ValueError:
-                st.markdown("> Primary source metadata not found.")
-            if len(relevant_chunks) > 1:
-                with st.expander("📄 Other Related Sources (Brief)"):
-                    for idx2, chunk in enumerate(relevant_chunks[1:], start=2):
-                        try:
-                            meta_idx = chunks.index(chunk)
-                            meta = metadata[meta_idx]
-                            st.markdown(f"- **Source {idx2}:** {meta['chapter']} ➔ {meta['section']} ➔ {meta['subsection']} ➔ {meta['topic']}")
-                        except ValueError:
-                            st.markdown(f"- Source {idx2}: Metadata not found.")
-        else:
-            st.info("No relevant sources found in the database.")
+        st.markdown(answer)
+        if pretty_sources:
+            with st.expander("📄 Sources for this answer"):
+                for i, s in enumerate(pretty_sources, start=1):
+                    meta = get_source_metadata(kb, s["id"])
+                    st.markdown(f"**Source {i}** — {meta['chapter']} ▸ {meta['section']} ▸ {meta['subsection']} ▸ {meta['topic']}")
+                    st.code(s["preview"])
