@@ -68,7 +68,7 @@ with st.sidebar:
                 SESSIONS_PATH.unlink(missing_ok=True)
             except Exception:
                 pass
-            st.experimental_rerun()
+            st.rerun()
 
     # Chat list
     for idx, chat in enumerate(st.session_state.chat_sessions):
@@ -76,7 +76,7 @@ with st.sidebar:
         label = chat["title"] or "Untitled"
         if st.button(("▶ " if is_active else "• ") + label, key=f"chat_{idx}", use_container_width=True):
             st.session_state.current_chat = idx
-            st.experimental_rerun()
+            st.rerun()
 
     # Preferences
     st.markdown("---")
@@ -147,4 +147,5 @@ if user_input:
                     meta = get_source_metadata(kb, s["id"])
                     st.markdown(f"**Source {i}** — {meta['chapter']} ▸ {meta['section']} ▸ {meta['subsection']} ▸ {meta['topic']}")
                     st.code(s["preview"])
+
 
