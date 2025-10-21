@@ -59,7 +59,7 @@ with st.sidebar:
             st.session_state.chat_sessions.append({"title": "New Chat", "messages": []})
             st.session_state.current_chat = len(st.session_state.chat_sessions) - 1
             save_sessions(st.session_state.chat_sessions)
-            st.experimental_rerun()
+            st.rerun()
     with cols[1]:
         if st.button("🗑️ Clear All", use_container_width=True):
             st.session_state.chat_sessions = []
@@ -147,5 +147,6 @@ if user_input:
                     meta = get_source_metadata(kb, s["id"])
                     st.markdown(f"**Source {i}** — {meta['chapter']} ▸ {meta['section']} ▸ {meta['subsection']} ▸ {meta['topic']}")
                     st.code(s["preview"])
+
 
 
