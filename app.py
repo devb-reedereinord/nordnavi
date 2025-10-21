@@ -116,17 +116,27 @@ if user_input:
         # Build conversation-aware query
         history_slice = active["messages"][-(st.session_state["max_history_turns"]*2):]
         conversation_text = build_conversation_context(history_slice)
-        # Hybrid retrieve
-        retrieved = retrieve_with_hybrid_search(kb, query=user_input, conversation=conversation_text, top_k=8)
+    
+        # Expand query if it's a situational question
+        expanded_query = expand_scenario_query(user_input)
+    
+        # Retrieve hybrid semantic + lexical context
+        retrieved = retrieve_with_hybrid_search(
+            kb,
+            query=expanded_query,
+            conversation=conversation_text,
+            top_k=8
+        )
 
+    # Automatically relax strictness for scenario-type questions
+    is_scenario = any(word in user_input.lower() for word in ["if", "when", "during", "situation", "happens", "while"])
+    
     with st.spinner("🤖 Thinking..."):
-        # Ask model with safety rails
         answer = ask_gpt_with_context(
             query=user_input,
             retrieved=retrieved,
-            strict=st.session_state["strict_mode"]
+            strict=st.session_state["strict_mode"] and not is_scenario
         )
-
     # Prepare pretty sources
     pretty_sources = [{
         "id": r["id"],
@@ -147,6 +157,7 @@ if user_input:
                     meta = get_source_metadata(kb, s["id"])
                     st.markdown(f"**Source {i}** — {meta['chapter']} ▸ {meta['section']} ▸ {meta['subsection']} ▸ {meta['topic']}")
                     st.code(s["preview"])
+
 
 
 
