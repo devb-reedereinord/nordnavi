@@ -87,7 +87,7 @@ with st.sidebar:
     st.session_state["max_history_turns"] = st.slider("History turns used for context", 4, 30, st.session_state["max_history_turns"])
 
 st.title("📚 NordNavi+")
-st.caption("Private RAG chatbot")
+st.caption("Reederei Nord IMS Chatbot")
 
 active = st.session_state.chat_sessions[st.session_state.current_chat]
 
@@ -147,6 +147,7 @@ if user_input:
                     meta = get_source_metadata(kb, s["id"])
                     st.markdown(f"**Source {i}** — {meta['chapter']} ▸ {meta['section']} ▸ {meta['subsection']} ▸ {meta['topic']}")
                     st.code(s["preview"])
+
 
 
 
