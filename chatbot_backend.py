@@ -85,7 +85,7 @@ def load_and_chunk(filepath: str, chunk_size: int = 1400, overlap: int = 120) ->
         elif lvl == 3:
             flush_buffer()
             subsection = raw.lstrip("# ").strip()
-        elif lvl >= 5:
+        elif lvl >= 4:
             flush_buffer()
             topic = raw.lstrip("# ").strip()
         else:
@@ -173,6 +173,20 @@ def _keyword_boost(query: str) -> List[str]:
                 expanded.update(syns)
     return list(expanded)
 
+def expand_scenario_query(query: str) -> str:
+    """
+    Expand situational queries with procedural and reasoning keywords
+    so the retriever fetches action-based guidance, not just definitions.
+    """
+    keywords = [
+        "action", "procedure", "response", "handling", "steps", "guideline",
+        "responsibility", "what to do", "safety", "checklist", "risk",
+        "prevention", "emergency", "instruction", "reporting"
+    ]
+    if any(word in query.lower() for word in ["if", "when", "during", "while", "happens", "situation", "scenario"]):
+        query = query + " " + " ".join(keywords)
+    return query
+
 def retrieve_with_hybrid_search(kb: KB, query: str, conversation: str = "", top_k: int = 8) -> List[Dict[str, Any]]:
     # Compose query with recent conversation for better semantic match
     composed = (conversation + "\n" + query).strip() if conversation else query
@@ -237,18 +251,22 @@ def retrieve_with_hybrid_search(kb: KB, query: str, conversation: str = "", top_
 
 def _build_prompt(retrieved: List[Dict[str, Any]], query: str, strict: bool) -> str:
     ctx = "\n\n---\n\n".join([r["chunk"] for r in retrieved])
-    policy = (
-        "Answer ONLY using the context. If the context is insufficient, say "
-        "\"The answer may not be fully covered in the current database context, but here's what I can infer.\""
-        if strict else
-        "Prefer the context. If needed, you may add general background knowledge, but do NOT contradict the context."
+    mode = (
+        "You are a company documentation assistant specializing in ship management and operations. "
+        "Your role is to interpret user questions—including situational or 'what if' questions—"
+        "based strictly on the company's documented procedures and best maritime practices."
     )
-    return f"""You are a ship-management domain assistant answering strictly from company documentation.
+    policy = (
+        "If the context does not directly describe the situation, reason through the most appropriate "
+        "steps, responses, or preventive actions based on related context and logical inference. "
+        "Always indicate when an inference or assumption is being made."
+        if strict else
+        "Prefer the context, but you may combine it with sound maritime reasoning. "
+        "Do not contradict the context."
+    )
+    return f"""{mode}
 
 {policy}
-
-Cite nothing except the provided context text; do not invent document names or numbers.
-Use concise, structured bullets when appropriate.
 
 [Context begins]
 {ctx}
@@ -256,7 +274,7 @@ Use concise, structured bullets when appropriate.
 
 User question: {query}
 
-Answer:
+Answer clearly, step-by-step if applicable, citing context where relevant.
 """
 
 def ask_gpt_with_context(query: str, retrieved: List[Dict[str, Any]], strict: bool = True) -> str:
@@ -274,5 +292,6 @@ def get_source_metadata(kb: KB, chunk_id: str) -> Dict[str,str]:
         return {"chapter":"Unknown","section":"Unknown","subsection":"Unknown","topic":"Unknown"}
     c = kb.chunks[i]
     return {"chapter": c.chapter, "section": c.section, "subsection": c.subsection, "topic": c.topic}
+
 
 
