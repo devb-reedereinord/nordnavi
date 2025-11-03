@@ -118,7 +118,7 @@ if user_input:
         conversation_text = build_conversation_context(history_slice)
     
         # Expand query if it's a situational question
-        expanded_query = expand_scenario_query(user_input)
+        expanded_query = user_input
     
         # Retrieve hybrid semantic + lexical context
         retrieved = retrieve_with_hybrid_search(
@@ -157,6 +157,7 @@ if user_input:
                     meta = get_source_metadata(kb, s["id"])
                     st.markdown(f"**Source {i}** — {meta['chapter']} ▸ {meta['section']} ▸ {meta['subsection']} ▸ {meta['topic']}")
                     st.code(s["preview"])
+
 
 
 
